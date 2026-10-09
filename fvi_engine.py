@@ -11,6 +11,8 @@ import numpy as np
 import pandas as pd
 import requests
 
+from historical import HistoricalStore
+
 
 FPL_BASE = "https://fantasy.premierleague.com/api"
 
@@ -25,10 +27,11 @@ class FVIConfig:
     # FDR 3 = neutral. FDR 1 ≈ +20%, FDR 5 ≈ -20% at sensitivity 0.10
     fixture_sensitivity: float = 0.10
 
-    # Baseline points blend (used for single / short horizons)
-    ep_next_weight: float = 0.45
-    form_weight: float = 0.30
-    ppg_weight: float = 0.25
+    # Baseline blend weights (adjusted further by horizon length)
+    ep_next_weight: float = 0.40
+    form_weight: float = 0.25
+    ppg_weight: float = 0.15
+    hist_ppg_weight: float = 0.20  # historical contribution
 
 
 class FPLClient:
@@ -41,7 +44,7 @@ class FPLClient:
         self.session = requests.Session()
         self.session.headers.update(
             {
-                "User-Agent": "FPL Fixture Value Index/1.1",
+                "User-Agent": "FPL Fixture Value Index/1.2",
                 "Accept": "application/json",
             }
         )
@@ -59,7 +62,6 @@ class FPLClient:
             response.raise_for_status()
             data = response.json()
         except requests.RequestException as exc:
-            # Fall back to stale cache if available
             if cache_file.exists():
                 return json.loads(cache_file.read_text(encoding="utf-8"))
             raise RuntimeError(
@@ -88,30 +90,33 @@ class FPLFixtureValueAgent:
       3. Price efficiency  20%
       4. Differential      15%
 
-    Final FVI is normalised to 0–100.
+    Points potential now blends current form with historical PPG
+    and minutes reliability from previous seasons.
     """
 
     def __init__(
         self,
         client: Optional[FPLClient] = None,
         config: Optional[FVIConfig] = None,
+        historical: Optional[HistoricalStore] = None,
     ):
         self.client = client or FPLClient()
         self.config = config or FVIConfig()
+        self.historical = historical or HistoricalStore()
         self.bootstrap_data = None
         self.fixtures_data = None
-        # Pre-built lookup tables (filled on load)
         self._players: Optional[pd.DataFrame] = None
         self._fixtures_by_team: Dict[int, List[dict]] = {}
 
     def load(self):
         self.bootstrap_data = self.client.bootstrap()
         self.fixtures_data = self.client.fixtures()
+        self.historical.load()
         self._build_lookup_tables()
         return self
 
     def _build_lookup_tables(self):
-        """Build player table and a per-team fixture list once."""
+        """Build player table (with historical metrics) and per-team fixtures."""
         b = self.bootstrap_data
         teams = pd.DataFrame(b["teams"])
         players = pd.DataFrame(b["elements"])
@@ -131,9 +136,38 @@ class FPLFixtureValueAgent:
             players["selected_by_percent"], errors="coerce"
         ).fillna(0.0)
 
+        # Merge historical metrics via stable `code`
+        hist = self.historical.get_lookup()
+        if not hist.empty and "code" in hist.columns:
+            players = players.merge(
+                hist[
+                    [
+                        "code",
+                        "hist_ppg",
+                        "last_season_ppg",
+                        "hist_minutes",
+                        "hist_minutes_pct",
+                        "seasons_played",
+                    ]
+                ],
+                on="code",
+                how="left",
+            )
+        else:
+            players["hist_ppg"] = np.nan
+            players["last_season_ppg"] = np.nan
+            players["hist_minutes"] = np.nan
+            players["hist_minutes_pct"] = np.nan
+            players["seasons_played"] = 0
+
+        players["hist_ppg"] = players["hist_ppg"].fillna(0.0)
+        players["last_season_ppg"] = players["last_season_ppg"].fillna(0.0)
+        players["hist_minutes_pct"] = players["hist_minutes_pct"].fillna(0.5)
+        players["seasons_played"] = players["seasons_played"].fillna(0).astype(int)
+
         self._players = players
 
-        # Pre-group fixtures by team for fast lookup
+        # Pre-group fixtures by team
         fixtures = pd.DataFrame(self.fixtures_data)
         self._fixtures_by_team = {}
 
@@ -184,33 +218,50 @@ class FPLFixtureValueAgent:
         return 100.0 - out if reverse else out
 
     def _fixture_rows(self, team_id: int, gw_start: int, gw_end: int) -> List[dict]:
-        """Return fixtures for a team inside the GW window (already pre-built)."""
         all_fx = self._fixtures_by_team.get(int(team_id), [])
         return [f for f in all_fx if gw_start <= f["gw"] <= gw_end]
 
     def _base_points_rate(self, p: pd.Series, num_gws: int) -> float:
         """
-        Transparent baseline.
-        For short horizons lean more on ep_next; for longer horizons lean on form + PPG.
+        Transparent baseline that now blends:
+        - current ep_next / form / season PPG
+        - historical PPG (from previous seasons)
+        - minutes reliability
         """
         ep_next = self._safe_float(p.get("ep_next"), 0.0)
         form = self._safe_float(p.get("form"), 0.0)
         ppg = self._safe_float(p.get("points_per_game"), 0.0)
+        hist_ppg = self._safe_float(p.get("hist_ppg"), 0.0)
+        minutes_pct = self._safe_float(p.get("hist_minutes_pct"), 0.5)
 
+        # Horizon-dependent weights
         if num_gws <= 2:
-            # Near-term: trust FPL's own expected points more
-            w_ep, w_form, w_ppg = 0.55, 0.25, 0.20
+            # Near-term: trust live FPL signals most
+            w_ep, w_form, w_ppg, w_hist = 0.50, 0.25, 0.15, 0.10
         elif num_gws <= 5:
-            w_ep, w_form, w_ppg = (
-                self.config.ep_next_weight,
-                self.config.form_weight,
-                self.config.ppg_weight,
-            )
+            w_ep, w_form, w_ppg, w_hist = 0.35, 0.25, 0.15, 0.25
         else:
-            # Longer run: form + season average matter more
-            w_ep, w_form, w_ppg = 0.25, 0.35, 0.40
+            # Longer run: historical performance matters more
+            w_ep, w_form, w_ppg, w_hist = 0.20, 0.20, 0.15, 0.45
 
-        base = w_ep * ep_next + w_form * form + w_ppg * ppg
+        # If we have no useful historical data, redistribute its weight
+        if hist_ppg <= 0.1:
+            total = w_ep + w_form + w_ppg
+            if total > 0:
+                w_ep, w_form, w_ppg = w_ep / total, w_form / total, w_ppg / total
+            w_hist = 0.0
+
+        base = (
+            w_ep * ep_next
+            + w_form * form
+            + w_ppg * ppg
+            + w_hist * hist_ppg
+        )
+
+        # Soft reliability adjustment (don't crush new / returning players)
+        reliability = 0.70 + 0.30 * min(1.0, max(0.0, minutes_pct))
+        base *= reliability
+
         return max(base, 0.1)
 
     def _availability_factor(self, p: pd.Series) -> float:
@@ -220,7 +271,6 @@ class FPLFixtureValueAgent:
         chance = self._safe_float(chance, 100)
         status = str(p.get("status", ""))
 
-        # Unavailable / suspended
         if status in {"u", "s"}:
             return 0.0
         return max(0.0, min(1.0, chance / 100.0))
@@ -256,7 +306,7 @@ class FPLFixtureValueAgent:
                 difficulties = [f["difficulty"] for f in fixtures]
                 avg_fdr = float(np.mean(difficulties))
             else:
-                avg_fdr = 5.0  # blank window treated as hard (no points)
+                avg_fdr = 5.0
 
             base = self._base_points_rate(p, num_gws)
             availability = self._availability_factor(p)
@@ -266,7 +316,6 @@ class FPLFixtureValueAgent:
 
             for f in fixtures:
                 difficulty = f["difficulty"]
-                # FDR 3 neutral → FDR 1 ≈ +20 %, FDR 5 ≈ -20 %
                 fixture_multiplier = 1.0 + (
                     (3.0 - difficulty) * cfg.fixture_sensitivity
                 )
@@ -283,13 +332,13 @@ class FPLFixtureValueAgent:
                     }
                 )
 
-            # Blank window → zero projected points
             if not fixtures:
                 projected_points = 0.0
 
             rows.append(
                 {
                     "id": int(p["id"]),
+                    "code": int(p.get("code", 0)),
                     "player": p["web_name"],
                     "first_name": p.get("first_name", ""),
                     "second_name": p.get("second_name", ""),
@@ -302,6 +351,10 @@ class FPLFixtureValueAgent:
                     "ppg": self._safe_float(p.get("points_per_game")),
                     "form": self._safe_float(p.get("form")),
                     "ep_next": self._safe_float(p.get("ep_next")),
+                    "hist_ppg": self._safe_float(p.get("hist_ppg")),
+                    "last_season_ppg": self._safe_float(p.get("last_season_ppg")),
+                    "hist_minutes_pct": self._safe_float(p.get("hist_minutes_pct")),
+                    "seasons_played": int(p.get("seasons_played", 0)),
                     "xgi": (
                         self._safe_float(p.get("expected_goals"))
                         + self._safe_float(p.get("expected_assists"))
@@ -342,7 +395,6 @@ class FPLFixtureValueAgent:
             + df["differential_score"] * cfg.differential_weight
         )
 
-        # Soft penalty for availability issues
         df["fvi"] *= df["availability"].clip(lower=0.0, upper=1.0)
 
         df["recommendation"] = np.select(
@@ -375,10 +427,19 @@ class FPLFixtureValueAgent:
         return " | ".join(parts) if parts else "No fixtures"
 
     def explain_player(self, row: pd.Series) -> str:
+        hist_bit = ""
+        if row.get("seasons_played", 0) > 0 and row.get("hist_ppg", 0) > 0.1:
+            hist_bit = (
+                f" Historical: {row['hist_ppg']:.1f} PPG across "
+                f"{int(row['seasons_played'])} season(s) "
+                f"({row['hist_minutes_pct']*100:.0f}% minutes). "
+            )
+
         return (
             f"{row['player']} ({row['team']}) scores {row['fvi']:.1f}/100. "
             f"Average FDR {row['avg_fdr']:.2f}, projected {row['projected_points']:.1f} "
             f"points over the selected window, £{row['price']:.1f}m, "
             f"{row['ownership']:.1f}% owned. "
+            f"{hist_bit}"
             f"Fixture run: {self.fixtures_string(row)}."
         )
