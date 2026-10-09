@@ -17,7 +17,7 @@ st.set_page_config(
 st.title("⚽ FPL Fixture Value Index")
 st.caption(
     "A transparent player-selection model combining fixture difficulty, "
-    "points potential, price efficiency and differential upside."
+    "points potential (current + historical), price efficiency and differential upside."
 )
 
 with st.expander("📖 How to use this tool (click to open)", expanded=False):
@@ -30,10 +30,15 @@ with st.expander("📖 How to use this tool (click to open)", expanded=False):
 4. Click any player expander below the table to see why the model likes them.
 5. Use the **Download CSV** button at the bottom to save the results.
 
+**What powers the score**
+- Live FPL data (price, ownership, form, fixtures, availability)
+- Historical baselines from previous seasons (PPG + minutes reliability)
+- Transparent weights you can adjust in the sidebar
+
 **Tips**
-- Lower the **Maximum ownership** slider to find differentials (under-owned players).
-- The **FVI weights** can be adjusted if you want to emphasise fixtures or value more.
-- A blank gameweek (no fixture) contributes zero projected points — the model does not pretend the player has a hard fixture.
+- Lower the **Maximum ownership** slider to find differentials.
+- Longer gameweek ranges give more weight to historical performance.
+- A blank gameweek contributes zero projected points.
         """
     )
 
@@ -73,7 +78,6 @@ with st.sidebar:
     )
 
     end_options = [gw for gw in available_gws if gw >= start_gw]
-    # Default to ~5 gameweeks ahead (or the last available)
     default_end_idx = min(4, len(end_options) - 1)
     end_gw = st.selectbox(
         "End gameweek",
@@ -106,7 +110,7 @@ with st.sidebar:
         max_value=900,
         value=90,
         step=30,
-        help="Filters out players who have barely played.",
+        help="Filters out players who have barely played this season.",
     )
 
     max_ownership = st.slider(
@@ -140,7 +144,6 @@ with st.sidebar:
         st.warning("Weights cannot all be zero.")
         st.stop()
 
-    # Normalise so they always sum to 1.0
     cfg = FVIConfig(
         fixture_weight=w_fixture / total_w,
         points_weight=w_points / total_w,
@@ -172,7 +175,7 @@ if not positions:
 # ---------------------------------------------------------------------------
 # Calculate
 # ---------------------------------------------------------------------------
-with st.spinner("Calculating Fixture Value Index…"):
+with st.spinner("Calculating Fixture Value Index (live + historical)…"):
     try:
         df = agent.calculate(
             start_gw,
@@ -222,7 +225,6 @@ cols[1].metric("Best FVI", f"{best['fvi']:.1f}")
 cols[2].metric("Best projected pts", f"{display['projected_points'].max():.1f}")
 cols[3].metric("Avg FDR of #1", f"{best['avg_fdr']:.2f}")
 
-# Simple bar chart of top FVI scores
 chart_data = display.set_index("player")[["fvi"]].head(12)
 st.bar_chart(chart_data, height=220)
 
@@ -293,6 +295,13 @@ for _, row in display.iterrows():
             f"Value {row['value_score']:.1f} · "
             f"Differential {row['differential_score']:.1f}"
         )
+        if row.get("seasons_played", 0) > 0 and row.get("hist_ppg", 0) > 0.1:
+            st.caption(
+                f"Historical → {row['hist_ppg']:.1f} PPG · "
+                f"Last season {row['last_season_ppg']:.1f} PPG · "
+                f"{row['hist_minutes_pct']*100:.0f}% minutes · "
+                f"{int(row['seasons_played'])} seasons"
+            )
         if row["news"]:
             st.warning(f"FPL news: {row['news']}")
 
@@ -350,5 +359,6 @@ st.download_button(
 
 st.caption(
     "FVI is a decision-support model, not a guarantee of future FPL points. "
-    "Data is sourced from the public Fantasy Premier League API."
+    "Live data from the public Fantasy Premier League API. "
+    "Historical baselines from the open vaastav/Fantasy-Premier-League dataset."
 )
