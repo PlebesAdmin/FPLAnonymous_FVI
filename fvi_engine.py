@@ -27,11 +27,8 @@ class FVIConfig:
     # FDR 3 = neutral. FDR 1 ≈ +20%, FDR 5 ≈ -20% at sensitivity 0.10
     fixture_sensitivity: float = 0.10
 
-    # Baseline blend weights (adjusted further by horizon length)
-    ep_next_weight: float = 0.40
-    form_weight: float = 0.25
-    ppg_weight: float = 0.15
-    hist_ppg_weight: float = 0.20  # historical contribution
+    # How strongly historical home/away split adjusts the baseline (0–1)
+    home_away_influence: float = 0.35
 
 
 class FPLClient:
@@ -44,7 +41,7 @@ class FPLClient:
         self.session = requests.Session()
         self.session.headers.update(
             {
-                "User-Agent": "FPL Fixture Value Index/1.2",
+                "User-Agent": "FPL Fixture Value Index/1.3",
                 "Accept": "application/json",
             }
         )
@@ -84,14 +81,10 @@ class FPLFixtureValueAgent:
     Calculates a transparent Fixture Value Index (FVI) for FPL players
     over a selected gameweek range.
 
-    Components (default weights):
-      1. Fixture quality   35%
-      2. Points potential  30%
-      3. Price efficiency  20%
-      4. Differential      15%
-
-    Points potential now blends current form with historical PPG
-    and minutes reliability from previous seasons.
+    Phase 2 additions:
+      - Historical home / away PPG splits applied per fixture
+      - Consistency score shown in explanations
+      - Stronger historical blend on longer horizons
     """
 
     def __init__(
@@ -116,7 +109,6 @@ class FPLFixtureValueAgent:
         return self
 
     def _build_lookup_tables(self):
-        """Build player table (with historical metrics) and per-team fixtures."""
         b = self.bootstrap_data
         teams = pd.DataFrame(b["teams"])
         players = pd.DataFrame(b["elements"])
@@ -136,38 +128,38 @@ class FPLFixtureValueAgent:
             players["selected_by_percent"], errors="coerce"
         ).fillna(0.0)
 
-        # Merge historical metrics via stable `code`
         hist = self.historical.get_lookup()
+        hist_cols = [
+            "code",
+            "hist_ppg",
+            "last_season_ppg",
+            "hist_ppg_home",
+            "hist_ppg_away",
+            "hist_minutes",
+            "hist_minutes_pct",
+            "seasons_played",
+            "consistency_score",
+            "n_starts",
+        ]
         if not hist.empty and "code" in hist.columns:
-            players = players.merge(
-                hist[
-                    [
-                        "code",
-                        "hist_ppg",
-                        "last_season_ppg",
-                        "hist_minutes",
-                        "hist_minutes_pct",
-                        "seasons_played",
-                    ]
-                ],
-                on="code",
-                how="left",
-            )
+            use_cols = [c for c in hist_cols if c in hist.columns]
+            players = players.merge(hist[use_cols], on="code", how="left")
         else:
-            players["hist_ppg"] = np.nan
-            players["last_season_ppg"] = np.nan
-            players["hist_minutes"] = np.nan
-            players["hist_minutes_pct"] = np.nan
-            players["seasons_played"] = 0
+            for c in hist_cols:
+                if c != "code":
+                    players[c] = np.nan
 
         players["hist_ppg"] = players["hist_ppg"].fillna(0.0)
         players["last_season_ppg"] = players["last_season_ppg"].fillna(0.0)
+        players["hist_ppg_home"] = players["hist_ppg_home"].fillna(players["hist_ppg"])
+        players["hist_ppg_away"] = players["hist_ppg_away"].fillna(players["hist_ppg"])
         players["hist_minutes_pct"] = players["hist_minutes_pct"].fillna(0.5)
         players["seasons_played"] = players["seasons_played"].fillna(0).astype(int)
+        players["consistency_score"] = players["consistency_score"].fillna(50.0)
+        players["n_starts"] = players["n_starts"].fillna(0).astype(int)
 
         self._players = players
 
-        # Pre-group fixtures by team
         fixtures = pd.DataFrame(self.fixtures_data)
         self._fixtures_by_team = {}
 
@@ -223,10 +215,7 @@ class FPLFixtureValueAgent:
 
     def _base_points_rate(self, p: pd.Series, num_gws: int) -> float:
         """
-        Transparent baseline that now blends:
-        - current ep_next / form / season PPG
-        - historical PPG (from previous seasons)
-        - minutes reliability
+        Overall baseline (before home/away split is applied per fixture).
         """
         ep_next = self._safe_float(p.get("ep_next"), 0.0)
         form = self._safe_float(p.get("form"), 0.0)
@@ -234,17 +223,13 @@ class FPLFixtureValueAgent:
         hist_ppg = self._safe_float(p.get("hist_ppg"), 0.0)
         minutes_pct = self._safe_float(p.get("hist_minutes_pct"), 0.5)
 
-        # Horizon-dependent weights
         if num_gws <= 2:
-            # Near-term: trust live FPL signals most
             w_ep, w_form, w_ppg, w_hist = 0.50, 0.25, 0.15, 0.10
         elif num_gws <= 5:
             w_ep, w_form, w_ppg, w_hist = 0.35, 0.25, 0.15, 0.25
         else:
-            # Longer run: historical performance matters more
             w_ep, w_form, w_ppg, w_hist = 0.20, 0.20, 0.15, 0.45
 
-        # If we have no useful historical data, redistribute its weight
         if hist_ppg <= 0.1:
             total = w_ep + w_form + w_ppg
             if total > 0:
@@ -258,11 +243,32 @@ class FPLFixtureValueAgent:
             + w_hist * hist_ppg
         )
 
-        # Soft reliability adjustment (don't crush new / returning players)
         reliability = 0.70 + 0.30 * min(1.0, max(0.0, minutes_pct))
         base *= reliability
 
         return max(base, 0.1)
+
+    def _fixture_base(self, p: pd.Series, overall_base: float, is_home: bool) -> float:
+        """
+        Adjust the overall baseline using historical home/away split.
+        Soft influence so we don't overfit sparse samples.
+        """
+        hist_ppg = self._safe_float(p.get("hist_ppg"), 0.0)
+        hist_home = self._safe_float(p.get("hist_ppg_home"), hist_ppg)
+        hist_away = self._safe_float(p.get("hist_ppg_away"), hist_ppg)
+
+        if hist_ppg <= 0.1:
+            return overall_base
+
+        split = hist_home if is_home else hist_away
+        # Ratio of venue-specific rate to overall historical rate
+        ratio = split / hist_ppg if hist_ppg > 0 else 1.0
+        # Bound the adjustment
+        ratio = max(0.75, min(1.25, ratio))
+
+        influence = self.config.home_away_influence
+        adjusted = overall_base * ((1.0 - influence) + influence * ratio)
+        return max(adjusted, 0.1)
 
     def _availability_factor(self, p: pd.Series) -> float:
         chance = p.get("chance_of_playing_next_round")
@@ -308,7 +314,7 @@ class FPLFixtureValueAgent:
             else:
                 avg_fdr = 5.0
 
-            base = self._base_points_rate(p, num_gws)
+            overall_base = self._base_points_rate(p, num_gws)
             availability = self._availability_factor(p)
 
             projected_points = 0.0
@@ -316,10 +322,14 @@ class FPLFixtureValueAgent:
 
             for f in fixtures:
                 difficulty = f["difficulty"]
+                is_home = bool(f["home"])
+
+                base = self._fixture_base(p, overall_base, is_home)
+
                 fixture_multiplier = 1.0 + (
                     (3.0 - difficulty) * cfg.fixture_sensitivity
                 )
-                home_multiplier = 1.03 if f["home"] else 0.98
+                home_multiplier = 1.03 if is_home else 0.98
 
                 pts = base * fixture_multiplier * home_multiplier * availability
                 projected_points += max(0.0, pts)
@@ -328,7 +338,7 @@ class FPLFixtureValueAgent:
                     {
                         "gw": f["gw"],
                         "difficulty": difficulty,
-                        "home": f["home"],
+                        "home": is_home,
                     }
                 )
 
@@ -353,8 +363,12 @@ class FPLFixtureValueAgent:
                     "ep_next": self._safe_float(p.get("ep_next")),
                     "hist_ppg": self._safe_float(p.get("hist_ppg")),
                     "last_season_ppg": self._safe_float(p.get("last_season_ppg")),
+                    "hist_ppg_home": self._safe_float(p.get("hist_ppg_home")),
+                    "hist_ppg_away": self._safe_float(p.get("hist_ppg_away")),
                     "hist_minutes_pct": self._safe_float(p.get("hist_minutes_pct")),
                     "seasons_played": int(p.get("seasons_played", 0)),
+                    "consistency_score": self._safe_float(p.get("consistency_score"), 50.0),
+                    "n_starts": int(p.get("n_starts", 0)),
                     "xgi": (
                         self._safe_float(p.get("expected_goals"))
                         + self._safe_float(p.get("expected_assists"))
@@ -373,7 +387,6 @@ class FPLFixtureValueAgent:
         if df.empty:
             return df
 
-        # Component scores (0–100)
         df["fixture_score"] = self._minmax(df["avg_fdr"], reverse=True)
         df["points_score"] = self._minmax(df["projected_points"])
 
@@ -430,9 +443,11 @@ class FPLFixtureValueAgent:
         hist_bit = ""
         if row.get("seasons_played", 0) > 0 and row.get("hist_ppg", 0) > 0.1:
             hist_bit = (
-                f" Historical: {row['hist_ppg']:.1f} PPG across "
-                f"{int(row['seasons_played'])} season(s) "
-                f"({row['hist_minutes_pct']*100:.0f}% minutes). "
+                f" Historical: {row['hist_ppg']:.1f} PPG "
+                f"(H {row['hist_ppg_home']:.1f} / A {row['hist_ppg_away']:.1f}) "
+                f"across {int(row['seasons_played'])} season(s), "
+                f"{row['hist_minutes_pct']*100:.0f}% minutes, "
+                f"consistency {row['consistency_score']:.0f}/100. "
             )
 
         return (
