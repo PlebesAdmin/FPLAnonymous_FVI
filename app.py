@@ -238,13 +238,13 @@ for _, row in display.iterrows():
             f"Differential {row['differential_score']:.1f}"
         )
         if row.get("seasons_played", 0) > 0 and row.get("hist_ppg", 0) > 0.1:
-    hist_ppg = row.get("hist_ppg", 0)
-    hist_home = row.get("hist_ppg_home", hist_ppg)
-    hist_away = row.get("hist_ppg_away", hist_ppg)
-    consistency = row.get("consistency_score", 50)
-    minutes_pct = row.get("hist_minutes_pct", 0)
-    seasons = int(row.get("seasons_played", 0))
-    n_starts = int(row.get("n_starts", 0))
+            hist_ppg = row.get("hist_ppg", 0)
+            hist_home = row.get("hist_ppg_home", hist_ppg)
+            hist_away = row.get("hist_ppg_away", hist_ppg)
+            consistency = row.get("consistency_score", 50)
+            minutes_pct = row.get("hist_minutes_pct", 0)
+            seasons = int(row.get("seasons_played", 0))
+            n_starts = int(row.get("n_starts", 0))
 
     st.caption(
         f"Historical → {hist_ppg:.1f} PPG "
