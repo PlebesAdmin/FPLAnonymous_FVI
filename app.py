@@ -246,16 +246,15 @@ for _, row in display.iterrows():
             seasons = int(row.get("seasons_played", 0))
             n_starts = int(row.get("n_starts", 0))
 
-    st.caption(
-        f"Historical → {hist_ppg:.1f} PPG "
-        f"(Home {hist_home:.1f} / Away {hist_away:.1f}) · "
-        f"Consistency {consistency:.0f}/100 · "
-        f"{minutes_pct*100:.0f}% minutes · "
-        f"{seasons} seasons · "
-        f"{n_starts} starts sampled"
-     )
-            
-        if row["news"]:
+            st.caption(
+                f"Historical → {hist_ppg:.1f} PPG "
+                f"(Home {hist_home:.1f} / Away {hist_away:.1f}) · "
+                f"Consistency {consistency:.0f}/100 · "
+                f"{minutes_pct*100:.0f}% minutes · "
+                f"{seasons} seasons · "
+                f"{n_starts} starts sampled"
+            )
+        if row.get("news"):
             st.warning(f"FPL news: {row['news']}")
 
 st.divider()
