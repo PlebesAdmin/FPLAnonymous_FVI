@@ -238,13 +238,22 @@ for _, row in display.iterrows():
             f"Differential {row['differential_score']:.1f}"
         )
         if row.get("seasons_played", 0) > 0 and row.get("hist_ppg", 0) > 0.1:
-            st.caption(
-                f"Historical → {row['hist_ppg']:.1f} PPG "
-                f"(Home {row['hist_ppg_home']:.1f} / Away {row['hist_ppg_away']:.1f}) · "
-                f"Consistency {row['consistency_score']:.0f}/100 · "
-                f"{row['hist_minutes_pct']*100:.0f}% minutes · "
-                f"{int(row['seasons_played'])} seasons · "
-                f"{int(row['n_starts'])} starts sampled"
+    hist_ppg = row.get("hist_ppg", 0)
+    hist_home = row.get("hist_ppg_home", hist_ppg)
+    hist_away = row.get("hist_ppg_away", hist_ppg)
+    consistency = row.get("consistency_score", 50)
+    minutes_pct = row.get("hist_minutes_pct", 0)
+    seasons = int(row.get("seasons_played", 0))
+    n_starts = int(row.get("n_starts", 0))
+
+    st.caption(
+        f"Historical → {hist_ppg:.1f} PPG "
+        f"(Home {hist_home:.1f} / Away {hist_away:.1f}) · "
+        f"Consistency {consistency:.0f}/100 · "
+        f"{minutes_pct*100:.0f}% minutes · "
+        f"{seasons} seasons · "
+        f"{n_starts} starts sampled"
+    )
             )
         if row["news"]:
             st.warning(f"FPL news: {row['news']}")
