@@ -254,7 +254,7 @@ for _, row in display.iterrows():
         f"{seasons} seasons · "
         f"{n_starts} starts sampled"
     )
-            )
+            
         if row["news"]:
             st.warning(f"FPL news: {row['news']}")
 
