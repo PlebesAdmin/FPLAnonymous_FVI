@@ -11,40 +11,34 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ---------------------------------------------------------------------------
-# Header + how-to
-# ---------------------------------------------------------------------------
 st.title("⚽ FPL Fixture Value Index")
 st.caption(
-    "A transparent player-selection model combining fixture difficulty, "
-    "points potential (current + historical), price efficiency and differential upside."
+    "Transparent player rankings using fixtures, current form, historical performance "
+    "(home/away + consistency), price and ownership."
 )
 
 with st.expander("📖 How to use this tool (click to open)", expanded=False):
     st.markdown(
         """
 **Quick start**
-1. In the left sidebar choose a **Start** and **End** gameweek (e.g. next 5 weeks).
-2. Optionally filter by **position**, **max price**, **ownership** and **minutes**.
-3. The table updates automatically and shows the highest-scoring players.
-4. Click any player expander below the table to see why the model likes them.
-5. Use the **Download CSV** button at the bottom to save the results.
+1. Choose a **Start** and **End** gameweek in the sidebar.
+2. Filter by position, price, ownership or minutes if you want.
+3. Rankings update automatically.
+4. Expand any player to see the full reasoning (including historical home/away and consistency).
 
-**What powers the score**
+**What the model uses**
 - Live FPL data (price, ownership, form, fixtures, availability)
-- Historical baselines from previous seasons (PPG + minutes reliability)
-- Transparent weights you can adjust in the sidebar
+- Historical PPG from previous seasons
+- Home vs Away historical rates applied to each fixture
+- Minutes reliability and consistency score
 
 **Tips**
-- Lower the **Maximum ownership** slider to find differentials.
-- Longer gameweek ranges give more weight to historical performance.
-- A blank gameweek contributes zero projected points.
+- Longer windows put more weight on historical performance.
+- Lower maximum ownership to surface differentials.
+- Blank gameweeks contribute zero projected points.
         """
     )
 
-# ---------------------------------------------------------------------------
-# Load agent (cached)
-# ---------------------------------------------------------------------------
 @st.cache_resource
 def get_agent():
     try:
@@ -64,9 +58,6 @@ next_gw = next(
     min(available_gws) if available_gws else 1,
 )
 
-# ---------------------------------------------------------------------------
-# Sidebar controls
-# ---------------------------------------------------------------------------
 with st.sidebar:
     st.header("⚙️ Filters")
 
@@ -74,7 +65,7 @@ with st.sidebar:
         "Start gameweek",
         available_gws,
         index=available_gws.index(next_gw) if next_gw in available_gws else 0,
-        help="First gameweek in the window you care about.",
+        help="First gameweek in the window.",
     )
 
     end_options = [gw for gw in available_gws if gw >= start_gw]
@@ -83,7 +74,7 @@ with st.sidebar:
         "End gameweek",
         end_options,
         index=default_end_idx,
-        help="Last gameweek in the window. Double gameweeks are counted automatically.",
+        help="Last gameweek. Double gameweeks are counted automatically.",
     )
 
     st.divider()
@@ -92,47 +83,16 @@ with st.sidebar:
         "Positions",
         ["GKP", "DEF", "MID", "FWD"],
         default=["GKP", "DEF", "MID", "FWD"],
-        help="Leave all selected to see every position.",
     )
 
-    max_price = st.slider(
-        "Maximum price (£m)",
-        min_value=4.0,
-        max_value=15.0,
-        value=15.0,
-        step=0.1,
-        help="Only show players at or below this price.",
-    )
-
-    min_minutes = st.slider(
-        "Minimum minutes played this season",
-        min_value=0,
-        max_value=900,
-        value=90,
-        step=30,
-        help="Filters out players who have barely played this season.",
-    )
-
-    max_ownership = st.slider(
-        "Maximum ownership (%)",
-        min_value=1.0,
-        max_value=100.0,
-        value=100.0,
-        step=1.0,
-        help="Lower this to deliberately search for differentials.",
-    )
-
-    top_n = st.slider(
-        "Players to display",
-        5,
-        40,
-        15,
-        help="How many rows appear in the main table.",
-    )
+    max_price = st.slider("Maximum price (£m)", 4.0, 15.0, 15.0, 0.1)
+    min_minutes = st.slider("Minimum minutes this season", 0, 900, 90, 30)
+    max_ownership = st.slider("Maximum ownership (%)", 1.0, 100.0, 100.0, 1.0)
+    top_n = st.slider("Players to display", 5, 40, 15)
 
     st.divider()
     st.markdown("### FVI weights")
-    st.caption("These must add up to roughly 100%. Adjust to suit your style.")
+    st.caption("Adjust to suit your style. Values are normalised automatically.")
 
     w_fixture = st.slider("Fixture ease %", 0, 60, 35, 5)
     w_points = st.slider("Points potential %", 0, 60, 30, 5)
@@ -161,20 +121,14 @@ with st.sidebar:
         f"Diff {cfg.differential_weight*100:.0f}%"
     )
 
-# ---------------------------------------------------------------------------
-# Validation
-# ---------------------------------------------------------------------------
 if end_gw < start_gw:
-    st.error("End gameweek must be greater than or equal to Start gameweek.")
+    st.error("End gameweek must be ≥ Start gameweek.")
     st.stop()
 
 if not positions:
     st.warning("Please select at least one position.")
     st.stop()
 
-# ---------------------------------------------------------------------------
-# Calculate
-# ---------------------------------------------------------------------------
 with st.spinner("Calculating Fixture Value Index (live + historical)…"):
     try:
         df = agent.calculate(
@@ -188,7 +142,7 @@ with st.spinner("Calculating Fixture Value Index (live + historical)…"):
         st.stop()
 
 if df.empty:
-    st.warning("No players matched the selected filters. Try lowering the minimum minutes.")
+    st.warning("No players matched the selected filters.")
     st.stop()
 
 filtered = df[
@@ -198,18 +152,12 @@ filtered = df[
 ].copy()
 
 if filtered.empty:
-    st.warning(
-        "No players match these filters. "
-        "Try increasing the price or ownership limit, or reducing minimum minutes."
-    )
+    st.warning("No players match these filters. Try relaxing price, ownership or minutes.")
     st.stop()
 
 display = filtered.head(top_n).copy()
 display["fixtures"] = display.apply(agent.fixtures_string, axis=1)
 
-# ---------------------------------------------------------------------------
-# Summary metrics + headline
-# ---------------------------------------------------------------------------
 st.subheader(f"Top {len(display)} players · GW{start_gw} → GW{end_gw}")
 
 best = display.iloc[0]
@@ -228,9 +176,6 @@ cols[3].metric("Avg FDR of #1", f"{best['avg_fdr']:.2f}")
 chart_data = display.set_index("player")[["fvi"]].head(12)
 st.bar_chart(chart_data, height=220)
 
-# ---------------------------------------------------------------------------
-# Main table
-# ---------------------------------------------------------------------------
 table = display[
     [
         "rank",
@@ -277,9 +222,6 @@ st.dataframe(
     },
 )
 
-# ---------------------------------------------------------------------------
-# Explanations
-# ---------------------------------------------------------------------------
 st.divider()
 st.subheader("Why the model likes them")
 
@@ -297,17 +239,16 @@ for _, row in display.iterrows():
         )
         if row.get("seasons_played", 0) > 0 and row.get("hist_ppg", 0) > 0.1:
             st.caption(
-                f"Historical → {row['hist_ppg']:.1f} PPG · "
-                f"Last season {row['last_season_ppg']:.1f} PPG · "
+                f"Historical → {row['hist_ppg']:.1f} PPG "
+                f"(Home {row['hist_ppg_home']:.1f} / Away {row['hist_ppg_away']:.1f}) · "
+                f"Consistency {row['consistency_score']:.0f}/100 · "
                 f"{row['hist_minutes_pct']*100:.0f}% minutes · "
-                f"{int(row['seasons_played'])} seasons"
+                f"{int(row['seasons_played'])} seasons · "
+                f"{int(row['n_starts'])} starts sampled"
             )
         if row["news"]:
             st.warning(f"FPL news: {row['news']}")
 
-# ---------------------------------------------------------------------------
-# Differentials section
-# ---------------------------------------------------------------------------
 st.divider()
 st.subheader("🔍 Find differentials (≤ 10% ownership)")
 
@@ -346,9 +287,6 @@ if not diffs.empty:
 else:
     st.info("No sub-10% ownership players matched the current filters.")
 
-# ---------------------------------------------------------------------------
-# Download
-# ---------------------------------------------------------------------------
 csv = display.to_csv(index=False).encode("utf-8")
 st.download_button(
     "⬇️ Download results as CSV",
@@ -360,5 +298,5 @@ st.download_button(
 st.caption(
     "FVI is a decision-support model, not a guarantee of future FPL points. "
     "Live data from the public Fantasy Premier League API. "
-    "Historical baselines from the open vaastav/Fantasy-Premier-League dataset."
+    "Historical baselines from vaastav/Fantasy-Premier-League."
 )
